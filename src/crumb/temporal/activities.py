@@ -20,6 +20,7 @@ from crumb.temporal.types import RunFinished
 from crumb.temporal.types import RunStarted
 from crumb.temporal.types import StepInput
 from crumb.transform import SqlFileTransformer
+from crumb.transform import affected_models
 
 log = logging.getLogger(__name__)
 
@@ -124,8 +125,24 @@ def run_transform(inp: StepInput) -> dict[str, Any]:
     with connect(settings.warehouse_dsn.get_secret_value(), autocommit=True) as conn:
         wh.bootstrap(conn, all_raw_tables())
         result = transformer.run(conn, timezone=settings.reporting_tz)
+        skipped = wh.skipped_tables(conn)
     log.info("transform built %s models", len(result.models))
-    return {"models": len(result.models), "rows": result.rows}
+    stats: dict[str, Any] = {"models": len(result.models), "rows": result.rows}
+    missing_raw = {
+        navi.TABLES[table].raw_table
+        for (source, table), _ in skipped.items()
+        if source == navi.SOURCE and table in navi.TABLES
+    }
+    degraded = affected_models(transformer.models(), missing_raw)
+    if degraded:
+        # Raw tables always exist (bootstrap), so these still build: empty if the
+        # source table never existed, or from previously extracted rows.
+        stats["degraded"] = {
+            fqn: f"source table(s) missing in Navi: {', '.join(raws)}; built without new data"
+            for fqn, raws in degraded.items()
+        }
+        log.warning("models built without missing source tables: %s", stats["degraded"])
+    return stats
 
 
 @activity.defn

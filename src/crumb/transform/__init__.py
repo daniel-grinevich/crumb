@@ -86,6 +86,25 @@ def order_models(models: list[Model]) -> list[Model]:
     return [by_fqn[f] for f in sorter.static_order()]
 
 
+def affected_models(models: list[Model], missing_raw: set[str]) -> dict[str, list[str]]:
+    """Models that (transitively) read any of ``missing_raw``, with the culprits."""
+    by_fqn = {m.fqn: m for m in models}
+    cache: dict[str, set[str]] = {}
+
+    def sources(fqn: str) -> set[str]:
+        if fqn not in cache:
+            m = by_fqn[fqn]
+            found = set(m.raw_sources)
+            for dep in m.depends_on:
+                found |= sources(dep)
+            cache[fqn] = found
+        return cache[fqn]
+
+    return {
+        m.fqn: sorted(sources(m.fqn) & missing_raw) for m in models if sources(m.fqn) & missing_raw
+    }
+
+
 class SqlFileTransformer:
     def __init__(self, package: str = "crumb.transform") -> None:
         self._package = package

@@ -109,9 +109,10 @@ def check_freshness(
     conn: psycopg.Connection[Any], *, max_age: dt.timedelta, stripe_enabled: bool
 ) -> list[CheckResult]:
     rows = conn.execute(
-        "select source, table_name, last_success_at from meta.watermarks"
+        "select source, table_name, last_success_at, status from meta.watermarks"
     ).fetchall()
     seen = {(r["source"], r["table_name"]): r["last_success_at"] for r in rows}
+    statuses = {(r["source"], r["table_name"]): r["status"] for r in rows}
     expected = [(navi.SOURCE, t) for t in navi.TABLES]
     if stripe_enabled:
         from crumb.sources import stripe_source
@@ -121,6 +122,12 @@ def check_freshness(
     results = []
     for source, table in expected:
         name = f"freshness:{source}.{table}"
+        status = statuses.get((source, table), "ok")
+        if status != "ok":
+            # Optional table absent from this Navi version; required ones fail
+            # the extract before we get here.
+            results.append(CheckResult(name, "skipped", status))
+            continue
         last = seen.get((source, table))
         if last is None:
             results.append(CheckResult(name, "failed", "never extracted successfully"))

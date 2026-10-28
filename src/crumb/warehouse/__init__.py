@@ -100,6 +100,7 @@ def set_watermark(
         values (%s, %s, %s, now(), %s, %s)
         on conflict (source, table_name) do update
             set watermark = greatest(w.watermark, excluded.watermark),
+                status = 'ok',
                 last_success_at = now(),
                 last_run_id = excluded.last_run_id,
                 rows_last_run = excluded.rows_last_run,
@@ -107,6 +108,34 @@ def set_watermark(
         """,
         (source, table, watermark, run_id, rows),
     )
+
+
+def mark_skipped(conn: Conn, source: str, table: str, status: str, run_id: str) -> None:
+    """Record that a table was deliberately not extracted (and why).
+
+    The watermark and last_success_at are left as they were, so a table that
+    disappears keeps its history and one that reappears resumes incrementally.
+    """
+    conn.execute(
+        """
+        insert into meta.watermarks as w (source, table_name, status, last_run_id, rows_last_run)
+        values (%s, %s, %s, %s, 0)
+        on conflict (source, table_name) do update
+            set status = excluded.status,
+                last_run_id = excluded.last_run_id,
+                rows_last_run = 0,
+                updated_at = now()
+        """,
+        (source, table, status, run_id),
+    )
+
+
+def skipped_tables(conn: Conn) -> dict[tuple[str, str], str]:
+    """(source, table) -> status for every table currently not being extracted."""
+    rows = conn.execute(
+        "select source, table_name, status from meta.watermarks where status <> 'ok'"
+    ).fetchall()
+    return {(r["source"], r["table_name"]): r["status"] for r in rows}
 
 
 def record_run_started(
