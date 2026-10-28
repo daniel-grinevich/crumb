@@ -12,6 +12,7 @@ select
     data->>'currency'                            as currency,
     data->>'customer'                            as stripe_customer_key,
     data->'metadata'->>'order_id'                as metadata_order_id,
+    data->'metadata'->>'environment'             as metadata_environment,
     data->>'failure_code'                        as failure_code,
     (data->>'livemode')::boolean                 as livemode,
     source_ts                                    as created_at

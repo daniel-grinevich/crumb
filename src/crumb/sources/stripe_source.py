@@ -51,8 +51,9 @@ OBJECTS: dict[str, StripeObject] = {
     ]
 }
 
-# Metadata keys Navi sets on PaymentIntents/Charges that are safe to keep.
-METADATA_KEYS = ("order_id",)
+# Metadata keys that are safe to keep. Navi sets order_id on PaymentIntents;
+# environment is honoured if Navi starts tagging objects (shared test accounts).
+METADATA_KEYS = ("order_id", "environment")
 
 
 class StripeLister(Protocol):

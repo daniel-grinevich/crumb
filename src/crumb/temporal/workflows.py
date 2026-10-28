@@ -19,6 +19,7 @@ from typing import Any
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import FailureError
+from temporalio.exceptions import is_cancelled_exception
 
 with workflow.unsafe.imports_passed_through():
     from crumb.sources import navi
@@ -102,8 +103,13 @@ async def tracked(
         stats = await body(run_id)
     except Skipped as skip:
         status, stats = "skipped", {"reason": skip.reason}
-    except FailureError as err:
-        status, error = "failed", describe_error(err)
+    except (FailureError, asyncio.CancelledError) as err:
+        # A cancelled workflow may still run activities after catching the
+        # cancellation, so the run is always closed out before re-raising.
+        if is_cancelled_exception(err):
+            status, error = "cancelled", "cancelled"
+        else:
+            status, error = "failed", describe_error(err)
         await _finish(RunFinished(run_id, status, stats, error))
         raise
     await _finish(RunFinished(run_id, status, stats, error))
@@ -245,7 +251,14 @@ class PipelineWorkflow:
                         ExtractStripeWorkflow.run, extract, id=f"{wf_id}-stripe"
                     )
                 )
-            extracts = await asyncio.gather(*children)
+            # Wait for every extract to finish before failing: returning early
+            # would make Temporal terminate the still-running sibling, which
+            # then never gets to record its own result in meta.runs.
+            outcomes = await asyncio.gather(*children, return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+            extracts = list(outcomes)
             transform = await workflow.execute_child_workflow(
                 TransformWorkflow.run,
                 TransformParams(run_checks=params.run_checks),

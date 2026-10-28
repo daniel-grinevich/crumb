@@ -70,7 +70,9 @@ Environment (unprefixed names are what the k8s manifests use; `CRUMB_*` works to
 | `PII_SALT` | worker | required, >= 16 chars, keep stable |
 | `CRUMB_API_KEY` | api | `X-API-Key` header value |
 | `STRIPE_API_KEY` | worker | optional |
-| `CRUMB_TEMPORAL_UI_URL`, `CRUMB_REPORTING_TZ`, `CRUMB_CREATE_SCHEDULES` | optional | see `src/crumb/config.py` |
+| `CRUMB_ENVIRONMENT` (or `ENVIRONMENT`) | worker | `local` / `staging` / `production`; set `production` in prod |
+| `CRUMB_RECONCILIATION_SEVERITY` | worker | `warn` or `fail`; default `fail` in production or with a live Stripe key, else `warn` |
+| `CRUMB_TEMPORAL_UI_URL`, `CRUMB_REPORTING_TZ`, `CRUMB_CREATE_SCHEDULES`, `CRUMB_NAVI_RECENT_REFRESH_HOURS` | optional | see `src/crumb/config.py` |
 
 ## Deploying
 

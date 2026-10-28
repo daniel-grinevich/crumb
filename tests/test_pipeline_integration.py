@@ -11,6 +11,7 @@ from temporalio.testing import ActivityEnvironment
 
 from crumb import quality
 from crumb import warehouse as wh
+from crumb.config import get_settings
 from crumb.db import connect
 from crumb.sources import navi
 from crumb.sources import stripe_source
@@ -199,34 +200,24 @@ def _charge(
     }
 
 
-def test_reconciliation_flags_orphans_double_charges_and_mismatches(wh_conn: Conn) -> None:
-    extract_all()
-    charged = wh_conn.execute(
-        """
-        select data->>'stripe_payment_intent_id' as pi, data->>'total_amount' as total,
-               data->>'amount_refunded' as refunded
-          from raw.navi_payments_payment
-         where data->>'status' in ('succeeded', 'refunded')
-         order by id
-        """
-    ).fetchall()
-    now = int(dt.datetime.now(dt.UTC).timestamp())
-    charges = [
-        _charge(
-            f"ch_{k}",
-            r["pi"],
-            round(float(r["total"]) * 100),
-            now - k,
-            refunded=round(float(r["refunded"]) * 100),
-        )
-        for k, r in enumerate(charged)
-    ]
-    good = len(charges)
-    charges.append(_charge("ch_orphan", "pi_unknown", 450, now))  # no Navi order
-    charges.append(_charge("ch_dup", charged[0]["pi"], 450, now))  # second charge, same PI
-    charges[1]["amount_refunded"] += 100  # Stripe refunded $1 Navi doesn't know about
-    fake = FakeStripe({"charges": charges, "payment_intents": [], "refunds": []})
+def _intent(
+    pid: str, cents: int, created: int, order_id: str = "", env: str = ""
+) -> dict[str, Any]:
+    metadata = {"order_id": order_id, "tax_calculation_id": "taxcalc_x"} if order_id else {}
+    if env:
+        metadata["environment"] = env
+    return {
+        "id": pid,
+        "amount": cents,
+        "amount_received": cents,
+        "currency": "usd",
+        "status": "succeeded",
+        "created": created,
+        "metadata": metadata,
+    }
 
+
+def load_fake_stripe(wh_conn: Conn, fake: "FakeStripe") -> None:
     for obj in stripe_source.OBJECTS.values():
         stripe_source.extract_object(
             obj,
@@ -240,43 +231,164 @@ def test_reconciliation_flags_orphans_double_charges_and_mismatches(wh_conn: Con
             resume_after=None,
             heartbeat=lambda _: None,
         )
-    assert count(wh_conn, "raw.stripe_charges") == good + 2
-    assert "billing_details" not in str(
-        wh_conn.execute("select data from raw.stripe_charges limit 1").fetchone()
-    )
 
-    SqlFileTransformer().run(wh_conn, timezone="UTC")
-    issues = {
+
+def issue_counts(wh_conn: Conn) -> dict[str, int]:
+    return {
         r["issue_type"]: r["n"]
         for r in wh_conn.execute(
             "select issue_type, count(*) as n from marts.reconciliation_issues group by 1"
         ).fetchall()
     }
-    assert issues == {"charge_without_order": 1, "double_charge": 2, "refund_mismatch": 1}
-    result = quality.check_reconciliation(wh_conn)
-    assert result.status == "failed"
+
+
+def test_reconciliation_is_scoped_to_this_navi(wh_conn: Conn) -> None:
+    extract_all()
+    charged = wh_conn.execute(
+        """
+        select p.data->>'stripe_payment_intent_id' as pi, p.data->>'total_amount' as total,
+               p.data->>'amount_refunded' as refunded, o.id as order_id
+          from raw.navi_payments_payment p
+          join raw.navi_orders_order o on o.data->>'payment_id' = p.id
+         where p.data->>'status' in ('succeeded', 'refunded')
+         order by p.id
+        """
+    ).fetchall()
+    uncharged_order = wh_conn.execute(
+        "select o.id from raw.navi_orders_order o join raw.navi_payments_payment p "
+        "on o.data->>'payment_id' = p.id where p.data->>'status' = 'canceled' limit 1"
+    ).fetchone()
+    assert uncharged_order is not None
+    now = int(dt.datetime.now(dt.UTC).timestamp())
+    intents = [_intent(r["pi"], 100, now, r["order_id"]) for r in charged]
+    charges = [
+        _charge(
+            f"ch_{k}",
+            r["pi"],
+            round(float(r["total"]) * 100),
+            now - k,
+            refunded=round(float(r["refunded"]) * 100),
+        )
+        for k, r in enumerate(charged)
+    ]
+    # Other environments sharing the test account: never this Navi's problem.
+    intents.append(_intent("pi_dev_1", 450, now, "11111111-1111-4111-8111-111111111111"))
+    charges.append(_charge("ch_dev_1", "pi_dev_1", 450, now))  # order unknown here
+    charges.append(_charge("ch_ci_1", "pi_ci_1", 300, now))  # no metadata at all
+    intents.append(_intent("pi_other_env", 450, now, uncharged_order["id"], env="production"))
+    charges.append(_charge("ch_other_env", "pi_other_env", 450, now))  # tagged elsewhere
+    # Real problems for this Navi.
+    intents.append(_intent("pi_unrecorded", 450, now, uncharged_order["id"]))
+    charges.append(_charge("ch_unrecorded", "pi_unrecorded", 450, now))  # Navi lost it
+    charges.append(_charge("ch_dup", charged[0]["pi"], 450, now))  # second charge, same PI
+    charges[1]["amount_refunded"] += 100  # Stripe refunded $1 Navi doesn't know about
+    load_fake_stripe(
+        wh_conn, FakeStripe({"charges": charges, "payment_intents": intents, "refunds": []})
+    )
+    assert "billing_details" not in str(
+        wh_conn.execute("select data from raw.stripe_charges limit 1").fetchone()
+    )
+
+    SqlFileTransformer().run(wh_conn, timezone="UTC", variables={"environment": "staging"})
+    scopes = {
+        r["charge_id"]: r["scope"]
+        for r in wh_conn.execute(
+            "select charge_id, scope from marts.stripe_charge_scope"
+        ).fetchall()
+    }
+    assert scopes["ch_dev_1"] == scopes["ch_ci_1"] == "unknown_to_this_navi"
+    assert scopes["ch_other_env"] == "other_environment"
+    assert scopes["ch_unrecorded"] == scopes["ch_0"] == "in_scope"
+    # The unrecorded charge's order also has the 'other_environment' charge, which
+    # must not make it a double charge.
+    assert issue_counts(wh_conn) == {
+        "charge_without_order": 1,
+        "double_charge": 2,
+        "refund_mismatch": 1,
+    }
+    orphan = wh_conn.execute(
+        "select charge_id, order_id::text from marts.reconciliation_issues "
+        "where issue_type = 'charge_without_order'"
+    ).fetchone()
+    assert orphan == {"charge_id": "ch_unrecorded", "order_id": uncharged_order["id"]}
     daily = wh_conn.execute(
-        "select bool_and(stripe_loaded) as loaded, sum(charges_without_order) as orphans "
+        "select sum(out_of_scope_charges) as oos, sum(charges_without_order) as orphans "
         "from marts.refunds_daily"
     ).fetchone()
-    assert daily == {"loaded": True, "orphans": 1}
+    assert daily == {"oos": 3, "orphans": 1}
 
-    # Second run pages from (watermark - lookback), not from the beginning of time.
-    fake.calls.clear()
-    stripe_source.extract_object(
-        stripe_source.OBJECTS["charges"],
-        lister=fake,
-        warehouse=wh_conn,
-        salt=TEST_SALT.encode(),
-        run_id="s2",
-        page_size=50,
-        lookback=dt.timedelta(seconds=10),
-        full_refresh=False,
-        resume_after=None,
-        heartbeat=lambda _: None,
+    failed = quality.check_reconciliation(wh_conn, "fail")
+    assert failed.status == "failed"
+    warned = quality.check_reconciliation(wh_conn, "warn")
+    assert warned.status == "warned"
+    assert warned.observed["charges_by_scope"]["unknown_to_this_navi"] == 2
+
+    # Matching environment tag stays in scope.
+    SqlFileTransformer().run(wh_conn, timezone="UTC", variables={"environment": "production"})
+    assert wh_conn.execute(
+        "select scope from marts.stripe_charge_scope where charge_id = 'ch_other_env'"
+    ).fetchone() == {"scope": "in_scope"}
+
+
+def test_foreign_charges_alone_reconcile_cleanly(wh_conn: Conn) -> None:
+    """The staging failure: a shared test account full of other environments' charges."""
+    extract_all()
+    now = int(dt.datetime.now(dt.UTC).timestamp())
+    charges = [_charge(f"ch_foreign_{k}", f"pi_foreign_{k}", 500, now - k) for k in range(21)]
+    intents = [
+        _intent(f"pi_foreign_{k}", 500, now - k, f"00000000-0000-4000-8000-{k:012d}")
+        for k in range(21)
+    ]
+    load_fake_stripe(
+        wh_conn, FakeStripe({"charges": charges, "payment_intents": intents, "refunds": []})
     )
-    assert fake.calls[0][1] is not None
+    SqlFileTransformer().run(wh_conn, timezone="UTC", variables={"environment": "staging"})
+    result = quality.check_reconciliation(wh_conn, "fail")
+    # Navi's own charged payments have no Stripe charge in this fake account, so
+    # only missing_stripe_charge can show up; nothing from the 21 foreign charges.
+    assert "charge_without_order" not in result.observed
+    assert "double_charge" not in result.observed
+    assert result.observed["charges_by_scope"] == {"unknown_to_this_navi": 21}
     assert wh.get_watermark(wh_conn, "stripe", "charges") is not None
+
+
+def test_warn_severity_keeps_quality_run_green(
+    wh_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extract_all()
+    now = int(dt.datetime.now(dt.UTC).timestamp())
+    order = wh_conn.execute(
+        "select o.id from raw.navi_orders_order o join raw.navi_payments_payment p "
+        "on o.data->>'payment_id' = p.id where p.data->>'status' = 'canceled' limit 1"
+    ).fetchone()
+    assert order is not None
+    load_fake_stripe(
+        wh_conn,
+        FakeStripe(
+            {
+                "charges": [_charge("ch_x", "pi_x", 450, now)],
+                "payment_intents": [_intent("pi_x", 450, now, order["id"])],
+                "refunds": [],
+            }
+        ),
+    )
+    env = ActivityEnvironment()
+    env.run(act.run_transform, StepInput("run-w"))
+    monkeypatch.setenv("CRUMB_RECONCILIATION_SEVERITY", "warn")
+    get_settings.cache_clear()
+    summary = env.run(act.run_quality_checks, StepInput("run-w"))
+    assert summary["failed"] == 0
+    assert summary["warned"] == 1
+    assert summary["warnings"][0]["name"] == "reconciliation"
+    stored = wh_conn.execute(
+        "select status from meta.dq_results where run_id = 'run-w' and check_name = 'reconciliation'"
+    ).fetchone()
+    assert stored == {"status": "warned"}
+
+    monkeypatch.setenv("CRUMB_RECONCILIATION_SEVERITY", "fail")
+    get_settings.cache_clear()
+    with pytest.raises(ApplicationError, match="reconciliation"):
+        env.run(act.run_quality_checks, StepInput("run-f"))
 
 
 def test_stripe_skips_without_key() -> None:

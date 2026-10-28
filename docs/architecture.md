@@ -30,8 +30,9 @@ new key); typing lives in one place, staging.
 | `daily_port_sales` | day × NaviPort: orders, revenue (charged totals incl. tax), refunds, avg ticket. Excludes staff test orders. |
 | `machine_uptime_daily` | day × Raspberry Pi: up seconds / uptime ratio, connects, disconnects, brews, errors |
 | `drink_popularity` | day × port × menu item: quantity, orders, revenue, rank |
-| `refunds_daily` | day: Navi vs Stripe refunds, reconciliation issue counts, `is_reconciled` |
-| `reconciliation_issues` | one row per Stripe↔Navi problem: `charge_without_order`, `double_charge`, `missing_stripe_charge`, `refund_mismatch` |
+| `refunds_daily` | day: Navi vs Stripe refunds (in-scope only), reconciliation issue counts, `out_of_scope_charges`, `is_reconciled` |
+| `stripe_charge_scope` | every Stripe charge with `scope`: `in_scope`, `unknown_to_this_navi`, `other_environment` (see Reconciliation scope) |
+| `reconciliation_issues` | one row per Stripe↔Navi problem among in-scope charges: `charge_without_order`, `double_charge`, `missing_stripe_charge`, `refund_mismatch` |
 | `customer_cohorts` | first-order month × months since: active customers, retention, repeat rate |
 
 Days are bucketed in `CRUMB_REPORTING_TZ` (default UTC). Uptime: any event except `disconnected`
@@ -75,8 +76,12 @@ Reliability:
 - **Idempotency**: raw upserts by source primary key (unchanged rows aren't rewritten); the
   watermark only moves forward and only after a table is fully read; transforms are full rebuilds
   in one transaction. Rerunning any window is safe.
-- **Run log**: every workflow writes `meta.runs` (running → succeeded / failed / skipped, stats,
-  flattened error chain, parent run id). Exposed at `GET /runs`, `GET /runs/{run_id}`.
+- **Run log**: every workflow writes `meta.runs` (running → succeeded / failed / skipped /
+  cancelled, stats, flattened error chain, parent run id). Exposed at `GET /runs`,
+  `GET /runs/{run_id}`. `PipelineWorkflow` waits for both extracts before failing, so a failing
+  extract never gets its sibling terminated mid-run. Workflows that close without running their own
+  code (terminated, timed out, reset) are reconciled from Temporal into `terminated` / `timed_out`
+  / etc. by a sweep: on every `GET /runs` / `GET /runs/{id}` and every 5 minutes in the worker.
 
 ### Schedules (created/updated by the worker on start)
 
@@ -113,6 +118,15 @@ Overlap policy `SKIP`: a slow run never queues another behind it.
   refunded), newest first, 100 per page.
 - `full-refresh` pipeline ignores watermarks.
 
+Navi moves orders through their lifecycle (claim → sent, done, cancel, refund) and assigns Pis to
+ports with queryset `.update()` calls, which don't bump `updated_at`. So:
+- `orders_order` and `payments_payment` also re-read every row created in the last
+  `CRUMB_NAVI_RECENT_REFRESH_HOURS` (72) each run, in a second extract phase (resumable on its
+  own; it doesn't move the watermark). Older status changes are picked up by `full-refresh`.
+- `devices_naviport` and `devices_raspberrypi` are re-read in full every run (a handful of rows).
+
+The proper fix is in Navi: include `updated_at=timezone.now()` in those `.update()` calls.
+
 Known v1 limits: hard deletes in Navi are not propagated (Navi soft-deletes; `is_deleted` is
 carried through and marts exclude it). Stripe objects modified more than 3 days after creation are
 only refreshed by `full-refresh`.
@@ -127,7 +141,24 @@ Results land in `meta.dq_results`; any failure fails the workflow with every fai
 - `not_empty:<mart>`: core marts are populated when their inputs are
 - `freshness:<source>.<table>`: last successful extract within `CRUMB_FRESHNESS_MAX_AGE_HOURS` (3h);
   `skipped` for optional tables missing from the source
-- `reconciliation`: `marts.reconciliation_issues` is empty (skipped until Stripe data exists)
+- `reconciliation`: `marts.reconciliation_issues` is empty (skipped until Stripe data exists).
+  Severity is `CRUMB_RECONCILIATION_SEVERITY` (`warn` | `fail`). Unset, it is `fail` when
+  `CRUMB_ENVIRONMENT=production` or the Stripe key is live (`sk_live_`/`rk_live_`), else `warn`.
+  A `warned` result doesn't fail the run but is stored in `meta.dq_results`, logged by the worker,
+  listed in the run's stats (`warnings`) and shown by `GET /quality`; the rows themselves are in
+  `GET /marts/reconciliation_issues` either way.
+
+### Reconciliation scope
+
+Stripe test accounts are shared by local dev, CI and staging, so a Stripe charge is only
+reconciled against this Navi if it belongs here. Navi puts `order_id` (the order UUID) and
+`tax_calculation_id` in **PaymentIntent** metadata (Stripe doesn't copy it to the Charge, so the
+charge is joined to its PaymentIntent). There is no environment tag today. A charge is `in_scope`
+if its PaymentIntent is recorded on a Navi payment, or its `order_id` metadata is an order in this
+Navi source. If an object carries `metadata.environment` (recommended for Navi:
+`metadata={"order_id": ..., "environment": settings.ENVIRONMENT}`), it must also equal
+`CRUMB_ENVIRONMENT`, otherwise it is `other_environment`. Everything else is
+`unknown_to_this_navi` and only counted (`out_of_scope_charges`).
 
 ## PII policy
 
@@ -158,6 +189,7 @@ Tests assert none of the seeded emails, phones or Stripe customer ids reach `raw
 | --- | --- |
 | `GET /health` | warehouse + Temporal reachability |
 | `GET /freshness` | per source table: `table` (also `table_name`), `status`, `required`, watermark, last success, age, `is_stale` |
+| `GET /quality` | latest result per data-quality check, failures and warnings first; `?status=warned` |
 | `GET /runs`, `GET /runs/{run_id}` | run log, filters `status`, `workflow_type`, `top_level_only`; detail adds child runs + live Temporal status |
 | `GET /pipelines`, `POST /pipelines/{name}/run` | start a named pipeline, returns workflow id, run id, Temporal UI link |
 | `GET /marts`, `GET /marts/{name}` | whitelisted marts only; `start_date`, `end_date`, `port_id`, `limit` (≤1000), `offset` |

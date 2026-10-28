@@ -5,7 +5,9 @@ Checks:
   * rowcount:<model>     - staging models built from one raw table keep every row
   * not_empty:<model>    - core marts are populated when their source has rows
   * freshness:<src>.<t>  - last successful extract is recent enough
-  * reconciliation       - no Stripe <-> Navi mismatches (skipped until Stripe loads)
+  * reconciliation       - no Stripe <-> Navi mismatches among charges belonging to this
+                           environment (skipped until Stripe loads); fails or only warns
+                           per CRUMB_RECONCILIATION_SEVERITY
 """
 
 import datetime as dt
@@ -143,20 +145,27 @@ def check_freshness(
     return results
 
 
-def check_reconciliation(conn: psycopg.Connection[Any]) -> CheckResult:
+def check_reconciliation(conn: psycopg.Connection[Any], severity: str = "fail") -> CheckResult:
+    """Mismatches are always recorded (marts.reconciliation_issues, dq_results);
+    ``severity`` decides whether they fail the run or only warn."""
     loaded = _scalar(conn, sql.SQL("select exists (select 1 from staging.stg_stripe_charges)"))
     if not loaded:
         return CheckResult("reconciliation", "skipped", "no Stripe data loaded yet")
     rows = conn.execute(
         "select issue_type, count(*) as n from marts.reconciliation_issues group by 1 order by 1"
     ).fetchall()
-    observed = {r["issue_type"]: r["n"] for r in rows}
-    if observed:
-        summary = ", ".join(f"{k}={v}" for k, v in observed.items())
-        return CheckResult(
-            "reconciliation", "failed", f"Stripe/Navi mismatches: {summary}", observed
-        )
-    return CheckResult("reconciliation", "passed")
+    observed: dict[str, Any] = {r["issue_type"]: r["n"] for r in rows}
+    scope = conn.execute(
+        "select scope, count(*) as n from marts.stripe_charge_scope group by 1"
+    ).fetchall()
+    charges_by_scope = {r["scope"]: r["n"] for r in scope}
+    issues = dict(observed)
+    observed["charges_by_scope"] = charges_by_scope
+    if issues:
+        summary = ", ".join(f"{k}={v}" for k, v in issues.items())
+        status = "failed" if severity == "fail" else "warned"
+        return CheckResult("reconciliation", status, f"Stripe/Navi mismatches: {summary}", observed)
+    return CheckResult("reconciliation", "passed", observed=observed)
 
 
 def run_checks(
@@ -166,6 +175,7 @@ def run_checks(
     max_age: dt.timedelta,
     stripe_enabled: bool,
     run_id: str,
+    reconciliation_severity: str = "fail",
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     for model in models:
@@ -176,7 +186,7 @@ def run_checks(
     for target, source in NOT_EMPTY.items():
         results.append(check_not_empty(conn, target, source))
     results.extend(check_freshness(conn, max_age=max_age, stripe_enabled=stripe_enabled))
-    results.append(check_reconciliation(conn))
+    results.append(check_reconciliation(conn, reconciliation_severity))
     conn.rollback()
 
     with conn.transaction(), conn.cursor() as cur:
@@ -192,9 +202,12 @@ def run_checks(
 
 def summarise(results: list[CheckResult]) -> dict[str, Any]:
     failed = [asdict(r) for r in results if r.status == "failed"]
+    warned = [asdict(r) for r in results if r.status == "warned"]
     return {
         "passed": sum(r.status == "passed" for r in results),
         "skipped": sum(r.status == "skipped" for r in results),
+        "warned": len(warned),
         "failed": len(failed),
+        "warnings": warned,
         "failures": failed,
     }

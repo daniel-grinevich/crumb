@@ -55,7 +55,11 @@ class Transformer(Protocol):
     def models(self) -> list[Model]: ...
 
     def run(
-        self, conn: psycopg.Connection[dict[str, Any]], *, timezone: str
+        self,
+        conn: psycopg.Connection[dict[str, Any]],
+        *,
+        timezone: str,
+        variables: dict[str, str] | None = None,
     ) -> TransformResult: ...
 
 
@@ -118,12 +122,22 @@ class SqlFileTransformer:
                     found.append(parse_model(layer, entry.name[:-4], entry.read_text()))
         return order_models(found)
 
-    def run(self, conn: psycopg.Connection[dict[str, Any]], *, timezone: str) -> TransformResult:
+    def run(
+        self,
+        conn: psycopg.Connection[dict[str, Any]],
+        *,
+        timezone: str,
+        variables: dict[str, str] | None = None,
+    ) -> TransformResult:
+        """Build every model. ``variables`` are readable in SQL as
+        ``current_setting('crumb.<name>', true)``."""
         built: list[str] = []
         rows: dict[str, int] = {}
         with conn.transaction():
             # Day bucketing (ts::date, date_trunc) follows the reporting timezone.
             conn.execute(sql.SQL("set local timezone to {}").format(sql.Literal(timezone)))
+            for name, value in (variables or {}).items():
+                conn.execute("select set_config(%s, %s, true)", (f"crumb.{name}", value))
             for model in self.models():
                 ident = sql.Identifier(model.layer, model.name)
                 conn.execute(sql.SQL("drop table if exists {} cascade").format(ident))
