@@ -71,3 +71,25 @@ Environment (unprefixed names are what the k8s manifests use; `CRUMB_*` works to
 | `CRUMB_API_KEY` | api | `X-API-Key` header value |
 | `STRIPE_API_KEY` | worker | optional |
 | `CRUMB_TEMPORAL_UI_URL`, `CRUMB_REPORTING_TZ`, `CRUMB_CREATE_SCHEDULES` | optional | see `src/crumb/config.py` |
+
+## Deploying
+
+CI (`.github/workflows/ci.yml`) runs lint (ruff, pyright), tests (against a Postgres service
+container) and an image build without pushing on every PR and push to `main`.
+
+Deploys are tag-driven and build the single image `ghcr.io/daniel-grinevich/crumb` (used by both
+`crumb-api` and `crumb-worker`). The tagged commit must already be on `main`, or the workflow fails.
+
+| Tag | Image tags pushed | rainbow-road change |
+|-----|-------------------|---------------------|
+| `v1.4.0-staging` (any `vX.Y.Z-staging*`) | `staging-latest`, `staging-<short-sha>`, the tag name | `staging/crumb/kustomization.yaml` `newTag: staging-<short-sha>` (ArgoCD auto-syncs) |
+| `v1.4.0` | `1.4.0`, `prod-latest`, `prod-<short-sha>`, the tag name | `production/crumb/kustomization.yaml` `newTag: 1.4.0` (sync manually in ArgoCD) |
+
+```sh
+git checkout main && git pull
+git tag v1.4.0-staging && git push origin v1.4.0-staging   # staging
+git tag v1.4.0 && git push origin v1.4.0                   # production
+```
+
+The manifest bump needs the `RAINBOW_ROAD_PAT` repo secret (write access to
+`daniel-grinevich/rainbow-road`).

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ['main']
+    paths-ignore: ['docs/**', '**.md']
+
+  push:
+    branches: ['main']
+    paths-ignore: ['docs/**', '**.md']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Pyright
+        run: uv run pyright
+
+  # Tests run on the runner against a Postgres service container. Integration
+  # tests create throwaway databases on it (tests/conftest.py, CRUMB_TEST_ADMIN_DSN);
+  # workflow tests use Temporal's time-skipping test server, which the SDK downloads.
+  pytest:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: crumb
+          POSTGRES_PASSWORD: crumb
+          POSTGRES_DB: crumb
+        ports: ['5440:5432']
+        options: >-
+          --health-cmd "pg_isready -U crumb -d crumb"
+          --health-interval 2s --health-timeout 5s --health-retries 15
+
+    env:
+      CRUMB_TEST_ADMIN_DSN: postgresql://crumb:crumb@localhost:5440/crumb
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # -rs lists skips, so a silently unreachable database shows up in the log.
+      - name: Run tests
+        run: uv run pytest -rs
+
+  # Proves the image we ship still builds, on the same arch as the cluster.
+  # The layer cache is only written on pushes, so PRs don't pay the upload.
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: false
+          cache-from: type=gha,scope=crumb
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,scope=crumb,mode=max' || '' }}
