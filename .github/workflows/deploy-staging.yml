@@ -90,7 +90,7 @@ jobs:
     needs: build-and-push-image
     runs-on: ubuntu-latest
     env:
-      NEW_TAG: staging-${{ needs.build-and-push-image.outputs.short-sha }}
+      SHA: ${{ needs.build-and-push-image.outputs.short-sha }}
       OVERLAY: staging/crumb/kustomization.yaml
     steps:
       - name: Checkout rainbow-road
@@ -99,13 +99,18 @@ jobs:
           repository: daniel-grinevich/rainbow-road
           token: ${{ secrets.RAINBOW_ROAD_PAT }}
 
-      # newTag sits on the line right after the image name in the overlay.
-      - name: Update staging image tag
+      # Staging always runs staging-latest (imagePullPolicy: Always), so newTag never
+      # changes. Bumping the pod-template annotation makes ArgoCD roll the pods onto
+      # the image just pushed. The value is quoted: an all-digit sha would be a YAML int.
+      - name: Bump deployed-sha annotation
         run: |
-          [ -n "$NEW_TAG" ] || { echo "::error::empty image tag"; exit 1; }
-          sed -i "\#name: ghcr.io/daniel-grinevich/crumb\$#{n;s/newTag: .*/newTag: ${NEW_TAG}/;}" "$OVERLAY"
-          grep -A1 'name: ghcr.io/daniel-grinevich/crumb$' "$OVERLAY" | grep -q "newTag: ${NEW_TAG}$" \
-            || { echo "::error::newTag not updated in $OVERLAY"; exit 1; }
+          [ -n "$SHA" ] || { echo "::error::empty sha"; exit 1; }
+          grep -q 'navi.dev/deployed-sha:' "$OVERLAY" \
+            || { echo "::error::no navi.dev/deployed-sha annotation in $OVERLAY"; exit 1; }
+          sed -i -E "s#^([[:space:]]*navi\.dev/deployed-sha:).*#\1 \"${SHA}\"#" "$OVERLAY"
+          if grep 'navi.dev/deployed-sha:' "$OVERLAY" | grep -vq "navi.dev/deployed-sha: \"${SHA}\"$"; then
+            echo "::error::deployed-sha not updated in $OVERLAY"; exit 1
+          fi
 
       - name: Commit and push
         run: |
@@ -113,10 +118,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$OVERLAY"
           if git diff --cached --quiet; then
-            echo "$OVERLAY already at $NEW_TAG"
+            echo "$OVERLAY already at $SHA"
             exit 0
           fi
-          git commit -m "deploy crumb staging: ${NEW_TAG#staging-}"
+          git commit -m "deploy crumb staging: ${SHA}"
           # Other repos' deploys push to rainbow-road too; rebase and retry on a race.
           for attempt in 1 2 3; do
             git push && exit 0

@@ -82,8 +82,13 @@ Deploys are tag-driven and build the single image `ghcr.io/daniel-grinevich/crum
 
 | Tag | Image tags pushed | rainbow-road change |
 |-----|-------------------|---------------------|
-| `v1.4.0-staging` (any `vX.Y.Z-staging*`) | `staging-latest`, `staging-<short-sha>`, the tag name | `staging/crumb/kustomization.yaml` `newTag: staging-<short-sha>` (ArgoCD auto-syncs) |
-| `v1.4.0` | `1.4.0`, `prod-latest`, `prod-<short-sha>`, the tag name | `production/crumb/kustomization.yaml` `newTag: 1.4.0` (sync manually in ArgoCD) |
+| `v1.4.0-staging` (any `vX.Y.Z-staging*`) | `staging-latest`, `staging-<short-sha>`, the tag name | `staging/crumb/kustomization.yaml`: pod-template annotation `navi.dev/deployed-sha: "<short-sha>"` (ArgoCD auto-syncs) |
+| `v1.4.0` | `1.4.0`, `prod-latest`, `prod-<short-sha>`, the tag name | `production/crumb/kustomization.yaml`: `newTag: 1.4.0` (sync manually in ArgoCD) |
+
+Staging always runs `staging-latest` (`imagePullPolicy: Always`); its `newTag` never changes.
+Bumping the `navi.dev/deployed-sha` annotation changes the pod template, so ArgoCD rolls the pods
+onto the freshly pushed image. `staging-<short-sha>` and the tag name are pushed for traceability
+and rollback. Production is pinned to the version tag.
 
 ```sh
 git checkout main && git pull
