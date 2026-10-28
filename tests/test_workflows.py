@@ -1,6 +1,7 @@
 """Workflow orchestration with Temporal's time-skipping test server and mocked
 activities (registered under the real activity names)."""
 
+import time
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,8 @@ class Fakes:
         self.flaky_table: str | None = None
         self.missing_table: str | None = None
         self.missing_required = False
+        self.slow_stripe = False
+        self.block_transform = False
         self.fail_quality = False
         self.calls: list[str] = []
 
@@ -83,11 +86,18 @@ class Fakes:
 
         @activity.defn(name="extract_stripe_object")
         def extract_stripe_object(inp: ExtractTableInput) -> dict[str, Any]:
+            if self.slow_stripe:
+                time.sleep(1.0)  # still running when the Navi extract fails
             self.calls.append(f"stripe:{inp.table}")
             return {"table": inp.table, "rows": 3, "pages": 1, "watermark": None}
 
         @activity.defn(name="run_transform")
         def run_transform(inp: StepInput) -> dict[str, Any]:
+            if self.block_transform:
+                self.calls.append("transform-started")
+                for _ in range(200):  # until cancelled (heartbeat delivers it)
+                    time.sleep(0.05)
+                    activity.heartbeat()
             self.calls.append("transform")
             return {"models": 25, "rows": {}}
 

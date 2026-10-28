@@ -1,38 +1,37 @@
--- Stripe <-> Navi mismatches, one row per problem. Empty means reconciled.
---   charge_without_order : a succeeded Stripe charge no Navi order accounts for
+-- Stripe <-> Navi mismatches for charges in this environment's scope (see
+-- marts.stripe_charge_scope). One row per problem; empty means reconciled.
+--   charge_without_order : succeeded charge for one of this Navi's orders (by
+--                          metadata) that no Navi payment records
 --   double_charge        : more than one succeeded charge for the same order
 --   missing_stripe_charge: Navi says charged, Stripe has no succeeded charge (only
 --                          checked once Stripe data has been loaded)
 --   refund_mismatch      : Navi refunded amount != Stripe refunded amount
 with charges as (
-    select
-        c.*,
-        coalesce(o.order_id::text, c.metadata_order_id) as order_ref,
-        o.order_id
-    from staging.stg_stripe_charges c
-    left join staging.stg_payments p on p.stripe_payment_intent_id = c.payment_intent_id
-    left join staging.stg_orders o on o.payment_id = p.payment_id
-    where c.status = 'succeeded'
+    select *
+    from marts.stripe_charge_scope
+    where scope = 'in_scope' and status = 'succeeded'
 ),
 stripe_loaded as (
     select exists (select 1 from staging.stg_stripe_charges) as loaded
 ),
 charge_totals as (
     select payment_intent_id, sum(amount_refunded) as amount_refunded
-    from staging.stg_stripe_charges
+    from marts.stripe_charge_scope
+    where scope = 'in_scope'
     group by payment_intent_id
 )
 select
     'charge_without_order'::text  as issue_type,
     charge_id,
     payment_intent_id,
-    null::uuid                    as order_id,
+    order_id,
     amount,
     created_at,
-    created_at::date              as date,
-    'succeeded Stripe charge has no matching Navi order' as detail
+    date,
+    format('succeeded Stripe charge for order %s, but no Navi payment records PaymentIntent %s',
+           order_id, payment_intent_id) as detail
 from charges
-where order_id is null
+where not recorded_in_navi
 union all
 select
     'double_charge',
@@ -41,12 +40,12 @@ select
     order_id,
     amount,
     created_at,
-    created_at::date,
-    format('%s succeeded charges for order %s', n, order_ref)
+    date,
+    format('%s succeeded charges for order %s', n, order_id)
 from (
-    select *, count(*) over (partition by order_ref) as n
+    select *, count(*) over (partition by order_id) as n
     from charges
-    where order_ref is not null
+    where order_id is not null
 ) d
 where n > 1
 union all

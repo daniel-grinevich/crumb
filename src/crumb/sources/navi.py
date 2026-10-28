@@ -16,6 +16,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from typing import Any
 
 import psycopg
@@ -43,6 +44,9 @@ class NaviTable:
     pseudonymise: dict[str, str] = field(default_factory=dict)
     # Required tables fail the extract when absent; optional ones are skipped.
     required: bool = False
+    # Also re-read rows with this column inside the recent window every run
+    # (status changes Navi makes without bumping updated_at).
+    recent_column: str | None = None
 
     @property
     def raw_table(self) -> str:
@@ -69,6 +73,7 @@ TABLES: dict[str, NaviTable] = {
              "created_by_id", "updated_by_id"),
             pseudonymise={"user_id": "user", **_AUDIT_USERS},
             required=True,
+            recent_column="created_at",
         ),
         NaviTable(
             "orders_orderitem",
@@ -93,6 +98,7 @@ TABLES: dict[str, NaviTable] = {
              "tax_amount", "total_amount", "currency", "status", "amount_refunded",
              "stripe_refund_id", "is_deleted", "created_at", "updated_at"),
             required=True,
+            recent_column="created_at",
         ),
         NaviTable(
             "payments_invoice",
@@ -101,16 +107,20 @@ TABLES: dict[str, NaviTable] = {
         NaviTable(
             "devices_naviport",
             # Street address lines and the customer-facing status_message dropped.
+            # Re-read in full each run: tiny, and Navi reassigns Pis with .update().
             ("id", "name", "slug", "city", "state_or_region", "postal_code",
              "country", "latitude", "longitude", "espresso_machine_id",
              "raspberry_pi_id", "accepting_orders", *_AUDIT),
             required=True,
+            watermark=None,
         ),
         NaviTable(
             "devices_raspberrypi",
-            # mac/ip addresses and device tokens dropped.
+            # mac/ip addresses and device tokens dropped. Re-read in full each run
+            # (tiny; Navi updates last_seen etc. without bumping updated_at).
             ("id", "name", "slug", "location", "is_connected", "firmware_version",
              "last_seen", "is_simulated", *_AUDIT),
+            watermark=None,
         ),
         NaviTable(
             "devices_espressomachine",
@@ -256,13 +266,16 @@ def fetch_page(
     return conn.execute(query, params).fetchall()
 
 
-def to_record(spec: NaviTable, row: dict[str, Any], salt: bytes) -> dict[str, Any]:
+def to_record(
+    spec: NaviTable, row: dict[str, Any], salt: bytes, source_ts_column: str | None = None
+) -> dict[str, Any]:
     """Source row -> raw record, with user identifiers pseudonymised."""
     data = {k: v for k, v in row.items() if k != "_wm"}
     for col, namespace in spec.pseudonymise.items():
         if col in data:
             data[col] = pseudonymise(salt, namespace, data[col])
-    return {"id": data["id"], "data": data, "source_ts": row["_wm"]}
+    source_ts = row[source_ts_column] if source_ts_column else row["_wm"]
+    return {"id": data["id"], "data": data, "source_ts": source_ts}
 
 
 @dataclass
@@ -273,6 +286,51 @@ class ExtractResult:
     watermark: str | None
     status: str = "ok"
     missing_columns: list[str] = field(default_factory=list)
+    # Rows re-read by the recent-rows pass (see extract_table).
+    recent_rows: int = 0
+
+
+def _copy_pages(
+    spec: NaviTable,
+    columns: list[str],
+    *,
+    navi: psycopg.Connection[Any],
+    warehouse: psycopg.Connection[Any],
+    salt: bytes,
+    run_id: str,
+    page_size: int,
+    since: dt.datetime | None,
+    cursor: Cursor | None,
+    on_page: Callable[[Cursor, int], None],
+    source_ts_column: str | None = None,
+) -> tuple[int, int, dt.datetime | None]:
+    """Keyset-page ``spec`` from ``since``/``cursor``, upserting each page.
+
+    Returns (rows, pages, max watermark value seen).
+    """
+    from crumb import warehouse as wh  # noqa: PLC0415
+
+    rows = pages = 0
+    max_ts: dt.datetime | None = None
+    while True:
+        page = fetch_page(navi, spec, columns, since=since, after=cursor, limit=page_size)
+        navi.rollback()  # end the read transaction between pages on the replica
+        if not page:
+            break
+        records = [to_record(spec, r, salt, source_ts_column) for r in page]
+        with warehouse.transaction():
+            wh.upsert_raw(warehouse, spec.raw_table, records, run_id)
+        rows += len(page)
+        pages += 1
+        last = page[-1]
+        last_ts = last["_wm"]
+        if last_ts is not None and (max_ts is None or last_ts > max_ts):
+            max_ts = last_ts
+        cursor = Cursor(ts=last_ts.isoformat() if last_ts else None, id=str(last["id"]))
+        on_page(cursor, rows)
+        if len(page) < page_size:
+            break
+    return rows, pages, max_ts
 
 
 def extract_table(
@@ -287,11 +345,20 @@ def extract_table(
     full_refresh: bool,
     resume_from: Cursor | None,
     heartbeat: Callable[[dict[str, Any]], None],
+    recent_window: dt.timedelta | None = None,
+    resume_phase: str = "incremental",
 ) -> ExtractResult:
     """Incrementally copy one table into raw.*, committing page by page.
 
-    Restart-safe: each page is committed with its upserts, the keyset cursor is
-    heartbeated, and the watermark is only advanced once the whole table is read.
+    Two phases, both restart-safe (pages commit with their upserts, the keyset
+    cursor and phase are heartbeated):
+
+    1. ``incremental``: rows whose watermark column moved since the last run.
+       The watermark advances once this phase has read the whole table.
+    2. ``recent`` (tables with ``recent_column``): rows created within
+       ``recent_window``, re-read regardless of updated_at, because Navi moves
+       orders/payments through their lifecycle with queryset ``.update()``
+       calls that don't touch updated_at.
     """
     from crumb import warehouse as wh  # noqa: PLC0415
 
@@ -309,41 +376,53 @@ def extract_table(
     missing = [c for c in spec.columns if c not in columns]
     if missing:
         log.warning("navi table %s lacks columns %s; extracting without them", spec.table, missing)
-    stored = None if full_refresh else wh.get_watermark(warehouse, SOURCE, spec.table)
-    since = stored - lookback if stored and spec.watermark else None
 
-    cursor = resume_from
-    max_ts: dt.datetime | None = stored
-    if cursor is not None and cursor.ts is not None:
-        # Pages before the resume point were committed by the previous attempt.
-        resumed_ts = dt.datetime.fromisoformat(cursor.ts)
-        max_ts = resumed_ts if max_ts is None else max(max_ts, resumed_ts)
     rows = pages = 0
-    while True:
-        page = fetch_page(navi, spec, columns, since=since, after=cursor, limit=page_size)
-        navi.rollback()  # end the read transaction between pages on the replica
-        if not page:
-            break
-        records = [to_record(spec, r, salt) for r in page]
-        with warehouse.transaction():
-            wh.upsert_raw(warehouse, spec.raw_table, records, run_id)
-        rows += len(page)
-        pages += 1
-        last = page[-1]
-        last_ts = last["_wm"]
-        if last_ts is not None and (max_ts is None or last_ts > max_ts):
-            max_ts = last_ts
-        cursor = Cursor(ts=last_ts.isoformat() if last_ts else None, id=str(last["id"]))
-        heartbeat({"cursor": cursor.to_json(), "rows": rows})
-        if len(page) < page_size:
-            break
+    stored = wh.get_watermark(warehouse, SOURCE, spec.table)
+    if resume_phase == "incremental":
+        start = None if full_refresh else stored
+        since = start - lookback if start and spec.watermark else None
+        max_ts = start
+        if resume_from is not None and resume_from.ts is not None:
+            # Pages before the resume point were committed by the previous attempt.
+            resumed_ts = dt.datetime.fromisoformat(resume_from.ts)
+            max_ts = resumed_ts if max_ts is None else max(max_ts, resumed_ts)
 
-    with warehouse.transaction():
-        wh.set_watermark(warehouse, SOURCE, spec.table, max_ts, rows, run_id)
+        def on_incremental(cursor: Cursor, n: int) -> None:
+            heartbeat({"phase": "incremental", "cursor": cursor.to_json(), "rows": n})
+
+        rows, pages, page_max = _copy_pages(
+            spec, columns, navi=navi, warehouse=warehouse, salt=salt, run_id=run_id,
+            page_size=page_size, since=since, cursor=resume_from, on_page=on_incremental,
+        )
+        if page_max is not None and (max_ts is None or page_max > max_ts):
+            max_ts = page_max
+        with warehouse.transaction():
+            wh.set_watermark(warehouse, SOURCE, spec.table, max_ts, rows, run_id)
+        stored = max_ts
+        resume_from = None
+
+    recent_rows = 0
+    recent_col = spec.recent_column
+    if recent_col and recent_window and recent_col in columns and not full_refresh:
+        recent_spec = replace(spec, watermark=recent_col)
+
+        def on_recent(cursor: Cursor, n: int) -> None:
+            heartbeat({"phase": "recent", "cursor": cursor.to_json(), "rows": rows + n})
+
+        source_ts_column = spec.watermark if spec.watermark in columns else None
+        recent_rows, recent_pages, _ = _copy_pages(
+            recent_spec, columns, navi=navi, warehouse=warehouse, salt=salt, run_id=run_id,
+            page_size=page_size, since=dt.datetime.now(dt.UTC) - recent_window,
+            cursor=resume_from, on_page=on_recent, source_ts_column=source_ts_column,
+        )
+        pages += recent_pages
+
     return ExtractResult(
         table=spec.table,
         rows=rows,
         pages=pages,
-        watermark=max_ts.isoformat() if max_ts else None,
+        watermark=stored.isoformat() if stored else None,
         missing_columns=missing,
+        recent_rows=recent_rows,
     )

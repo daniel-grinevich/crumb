@@ -60,6 +60,15 @@ class RunList(BaseModel):
     runs: list[Run]
 
 
+class QualityResult(BaseModel):
+    check_name: str
+    status: str  # passed | failed | warned | skipped
+    message: str
+    observed: dict[str, Any]
+    run_id: str | None
+    checked_at: dt.datetime
+
+
 class PipelineInfo(BaseModel):
     name: str
     workflow: str

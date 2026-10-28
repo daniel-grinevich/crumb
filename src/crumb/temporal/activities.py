@@ -63,6 +63,7 @@ def extract_navi_table(inp: ExtractTableInput) -> dict[str, Any]:
     spec = navi.TABLES[inp.table]
     resume = _resume_details()
     cursor = navi.Cursor.from_json(resume["cursor"]) if resume else None
+    phase = resume.get("phase", "incremental") if resume else "incremental"
     with (
         connect(settings.navi_dsn.get_secret_value(), read_only=True) as source,
         connect(settings.warehouse_dsn.get_secret_value(), autocommit=True) as warehouse,
@@ -78,6 +79,8 @@ def extract_navi_table(inp: ExtractTableInput) -> dict[str, Any]:
             full_refresh=inp.full_refresh,
             resume_from=cursor,
             heartbeat=activity.heartbeat,
+            recent_window=dt.timedelta(hours=settings.navi_recent_refresh_hours),
+            resume_phase=phase,
         )
     log.info("extracted navi.%s: %s rows in %s pages", spec.table, result.rows, result.pages)
     return asdict(result)
@@ -124,7 +127,11 @@ def run_transform(inp: StepInput) -> dict[str, Any]:
     transformer = SqlFileTransformer()
     with connect(settings.warehouse_dsn.get_secret_value(), autocommit=True) as conn:
         wh.bootstrap(conn, all_raw_tables())
-        result = transformer.run(conn, timezone=settings.reporting_tz)
+        result = transformer.run(
+            conn,
+            timezone=settings.reporting_tz,
+            variables={"environment": settings.environment},
+        )
         skipped = wh.skipped_tables(conn)
     log.info("transform built %s models", len(result.models))
     stats: dict[str, Any] = {"models": len(result.models), "rows": result.rows}
@@ -155,8 +162,11 @@ def run_quality_checks(inp: StepInput) -> dict[str, Any]:
             max_age=dt.timedelta(hours=settings.freshness_max_age_hours),
             stripe_enabled=settings.stripe_api_key is not None,
             run_id=inp.run_id,
+            reconciliation_severity=settings.effective_reconciliation_severity(),
         )
     summary = quality.summarise(results)
+    for warning in summary["warnings"]:
+        log.warning("data-quality warning %s: %s", warning["name"], warning["message"])
     if summary["failed"]:
         lines = "; ".join(f"{f['name']}: {f['message']}" for f in summary["failures"])
         raise ApplicationError(

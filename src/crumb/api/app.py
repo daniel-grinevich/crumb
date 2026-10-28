@@ -1,5 +1,6 @@
 """crumb API: pipeline runs, freshness and read-only marts for Navi MCP / bean."""
 
+import asyncio
 import datetime as dt
 import logging
 import secrets
@@ -32,6 +33,7 @@ from crumb.api.models import MartInfo
 from crumb.api.models import MartPage
 from crumb.api.models import PipelineInfo
 from crumb.api.models import PipelineStarted
+from crumb.api.models import QualityResult
 from crumb.api.models import Run
 from crumb.api.models import RunList
 from crumb.config import Settings
@@ -41,6 +43,7 @@ from crumb.temporal.activities import all_raw_tables
 from crumb.temporal.pipelines import PIPELINES
 from crumb.temporal.pipelines import connect_client
 from crumb.temporal.pipelines import start_pipeline
+from crumb.temporal.runsync import sync_open_runs
 
 log = logging.getLogger(__name__)
 
@@ -163,15 +166,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for r in rows
         ]
 
+    async def sync_runs(request: Request, run_ids: list[str] | None = None) -> None:
+        """Best effort: correct 'running' rows that Temporal has already closed."""
+        try:
+            client = await request.app.state.temporal.client()
+            with request.app.state.pool.connection(timeout=5) as conn:
+                await asyncio.wait_for(sync_open_runs(client, conn, run_ids=run_ids), timeout=5)
+        except Exception as err:
+            log.info("run status sync skipped: %s", err)
+
     @app.get("/runs", response_model=RunList, dependencies=authed, tags=["runs"])
-    def list_runs(
+    async def list_runs(
+        request: Request,
         conn: Db,
-        status: Annotated[str | None, Query(pattern="^(running|succeeded|failed|skipped)$")] = None,
+        status: Annotated[
+            str | None,
+            Query(pattern="^(running|succeeded|failed|skipped|cancelled|terminated|timed_out)$"),
+        ] = None,
         workflow_type: str | None = None,
         top_level_only: bool = False,
         limit: Annotated[int, Query(ge=1, le=500)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> RunList:
+        await sync_runs(request)
         where = [
             sql.SQL("(%(status)s::text is null or status = %(status)s)"),
             sql.SQL("(%(wf)s::text is null or workflow_type = %(wf)s)"),
@@ -201,6 +218,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/runs/{run_id}", response_model=Run, dependencies=authed, tags=["runs"])
     async def get_run(request: Request, run_id: str) -> Run:
+        await sync_runs(request, [run_id])
         with request.app.state.pool.connection(timeout=5) as conn:
             row = conn.execute("select * from meta.runs where run_id = %s", (run_id,)).fetchone()
             children = conn.execute(
@@ -219,6 +237,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as err:  # history may be gone (retention) or Temporal down
             log.info("temporal describe failed for %s: %s", run_id, err)
         return run
+
+    @app.get("/quality", response_model=list[QualityResult], dependencies=authed, tags=["ops"])
+    def latest_quality(
+        conn: Db,
+        status: Annotated[str | None, Query(pattern="^(passed|failed|skipped|warned)$")] = None,
+    ) -> list[QualityResult]:
+        """The most recent result of every data-quality check (warnings included)."""
+        rows = conn.execute(
+            """
+            select * from (
+                select distinct on (check_name) check_name, status, message, observed,
+                       run_id, checked_at
+                  from meta.dq_results
+                 order by check_name, checked_at desc
+            ) latest
+             where %(status)s::text is null or status = %(status)s
+             order by case status when 'failed' then 0 when 'warned' then 1 else 2 end,
+                      check_name
+            """,
+            {"status": status},
+        ).fetchall()
+        return [QualityResult(**r) for r in rows]
 
     @app.get("/pipelines", response_model=list[PipelineInfo], dependencies=authed, tags=["runs"])
     def list_pipelines() -> list[PipelineInfo]:
