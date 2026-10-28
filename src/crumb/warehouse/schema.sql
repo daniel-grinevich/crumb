@@ -16,6 +16,9 @@ create table if not exists meta.watermarks (
     primary key (source, table_name)
 );
 
+-- 'ok', or why the table wasn't extracted (e.g. 'skipped: table missing').
+alter table meta.watermarks add column if not exists status text not null default 'ok';
+
 -- Every workflow run (scheduled or manual), written by the workflows themselves.
 create table if not exists meta.runs (
     run_id        text primary key,

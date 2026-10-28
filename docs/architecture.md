@@ -95,6 +95,20 @@ Overlap policy `SKIP`: a slow run never queues another behind it.
   `earned_at` for awards, `coalesce(last_login, date_joined)` for users. `awards_awardlevel` has no
   timestamp and is re-read in full (tiny). Selects only allowlisted columns and skips any missing
   from the source, so older Navi schemas still work. Connections are read-only.
+- **Older Navi versions**: allowlisted columns missing from the source are skipped (logged, and
+  listed as `missing_columns` in the run stats). Whole tables are **required** or **optional**:
+
+  | Required (missing → extract fails, non-retryable `MissingTableError`) | Optional (missing → skipped) |
+  | --- | --- |
+  | `orders_order`, `orders_orderitem`, `payments_payment`, `devices_naviport` | everything else: users, menu, devices/Pis/machines, `devices_deviceevent`, `orders_machineerrorlog`, `orders_ordercustomization`, invoices, `awards_*` |
+
+  A skipped table gets `status = 'skipped: table missing'` in `meta.watermarks` (watermark and last
+  success are kept, so it resumes incrementally if it reappears), shows up in `GET /freshness`
+  (`status`, `required`, never `is_stale`), is listed under `skipped_tables` in the
+  `ExtractNaviWorkflow` stats in `meta.runs`, and its freshness check is `skipped`. Raw tables
+  always exist, so dependent models still build (empty if the table never existed); the transform
+  run's stats list them under `degraded` with the missing source tables (e.g. no
+  `devices_deviceevent` → `marts.machine_uptime_daily` is empty).
 - **Stripe**: `created >= watermark − 3 days` (objects change after creation, e.g. charges get
   refunded), newest first, 100 per page.
 - `full-refresh` pipeline ignores watermarks.
@@ -111,7 +125,8 @@ Results land in `meta.dq_results`; any failure fails the workflow with every fai
 - `unique:<model>`: declared `unique_key` has no duplicates or nulls (all keyed models)
 - `rowcount:<staging model>`: single-source staging models keep every raw row
 - `not_empty:<mart>`: core marts are populated when their inputs are
-- `freshness:<source>.<table>`: last successful extract within `CRUMB_FRESHNESS_MAX_AGE_HOURS` (3h)
+- `freshness:<source>.<table>`: last successful extract within `CRUMB_FRESHNESS_MAX_AGE_HOURS` (3h);
+  `skipped` for optional tables missing from the source
 - `reconciliation`: `marts.reconciliation_issues` is empty (skipped until Stripe data exists)
 
 ## PII policy
@@ -142,7 +157,7 @@ Tests assert none of the seeded emails, phones or Stripe customer ids reach `raw
 | Endpoint | |
 | --- | --- |
 | `GET /health` | warehouse + Temporal reachability |
-| `GET /freshness` | per source table: watermark, last success, age, `is_stale` |
+| `GET /freshness` | per source table: `table` (also `table_name`), `status`, `required`, watermark, last success, age, `is_stale` |
 | `GET /runs`, `GET /runs/{run_id}` | run log, filters `status`, `workflow_type`, `top_level_only`; detail adds child runs + live Temporal status |
 | `GET /pipelines`, `POST /pipelines/{name}/run` | start a named pipeline, returns workflow id, run id, Temporal UI link |
 | `GET /marts`, `GET /marts/{name}` | whitelisted marts only; `start_date`, `end_date`, `port_id`, `limit` (≤1000), `offset` |

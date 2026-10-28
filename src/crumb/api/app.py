@@ -36,6 +36,7 @@ from crumb.api.models import Run
 from crumb.api.models import RunList
 from crumb.config import Settings
 from crumb.config import get_settings
+from crumb.sources import navi
 from crumb.temporal.activities import all_raw_tables
 from crumb.temporal.pipelines import PIPELINES
 from crumb.temporal.pipelines import connect_client
@@ -140,7 +141,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def freshness(conn: Db) -> list[Freshness]:
         rows = conn.execute(
             """
-            select source, table_name, watermark, last_success_at, last_run_id, rows_last_run,
+            select source, table_name, status, watermark, last_success_at, last_run_id,
+                   rows_last_run,
                    extract(epoch from now() - last_success_at)::bigint as age_seconds
               from meta.watermarks
              order by source, table_name
@@ -148,7 +150,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ).fetchall()
         max_age = settings.freshness_max_age_hours * 3600
         return [
-            Freshness(**r, is_stale=r["age_seconds"] is None or r["age_seconds"] > max_age)
+            Freshness(
+                **r,
+                table=r["table_name"],
+                required=r["source"] == navi.SOURCE
+                and r["table_name"] in navi.TABLES
+                and navi.TABLES[r["table_name"]].required,
+                # A skipped optional table isn't stale; there's nothing to extract.
+                is_stale=r["status"] == "ok"
+                and (r["age_seconds"] is None or r["age_seconds"] > max_age),
+            )
             for r in rows
         ]
 

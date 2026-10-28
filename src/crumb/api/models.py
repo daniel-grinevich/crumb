@@ -14,7 +14,13 @@ class Health(BaseModel):
 
 class Freshness(BaseModel):
     source: str
+    table: str
+    # Same value as ``table``; kept for clients written against the first release.
     table_name: str
+    # 'ok', or why it isn't extracted, e.g. 'skipped: table missing'.
+    status: str
+    # Required tables fail the pipeline when missing; optional ones are skipped.
+    required: bool
     watermark: dt.datetime | None
     last_success_at: dt.datetime | None
     last_run_id: str | None

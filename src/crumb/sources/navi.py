@@ -3,11 +3,16 @@
 Every table has an explicit column allowlist. Anything not listed (emails,
 names, phones, passwords, tokens, IPs, user agents, free text) is never even
 selected. User identifiers listed in ``pseudonymise`` are replaced with a salted
-HMAC before landing (see ``crumb.pii``). Columns missing from the source (an
-older Navi schema) are skipped, so the same specs work across Navi versions.
+HMAC before landing (see ``crumb.pii``).
+
+The same specs work across Navi versions: columns missing from the source (an
+older Navi schema) are skipped, and so are whole tables unless they are
+``required``. A missing required table fails the extract, because the core
+marts (orders, sales, refunds) would silently be wrong without it.
 """
 
 import datetime as dt
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
@@ -20,6 +25,8 @@ from crumb.db import trusted_sql
 from crumb.pii import pseudonymise
 
 SOURCE = "navi"
+
+log = logging.getLogger(__name__)
 
 _AUDIT = ("status", "is_deleted", "deleted_at", "created_at", "updated_at")
 _AUDIT_USERS = {"created_by_id": "user", "updated_by_id": "user"}
@@ -34,6 +41,8 @@ class NaviTable:
     watermark: str | None = "updated_at"
     id_type: str = "uuid"
     pseudonymise: dict[str, str] = field(default_factory=dict)
+    # Required tables fail the extract when absent; optional ones are skipped.
+    required: bool = False
 
     @property
     def raw_table(self) -> str:
@@ -59,10 +68,12 @@ TABLES: dict[str, NaviTable] = {
              "claimed_by_id", "claimed_at", "is_test", *_AUDIT,
              "created_by_id", "updated_by_id"),
             pseudonymise={"user_id": "user", **_AUDIT_USERS},
+            required=True,
         ),
         NaviTable(
             "orders_orderitem",
             ("id", "order_id", "menu_item_id", "quantity", "unit_price", *_AUDIT),
+            required=True,
         ),
         NaviTable(
             "orders_ordercustomization",
@@ -81,6 +92,7 @@ TABLES: dict[str, NaviTable] = {
             ("id", "stripe_payment_intent_id", "amount_received", "subtotal",
              "tax_amount", "total_amount", "currency", "status", "amount_refunded",
              "stripe_refund_id", "is_deleted", "created_at", "updated_at"),
+            required=True,
         ),
         NaviTable(
             "payments_invoice",
@@ -92,6 +104,7 @@ TABLES: dict[str, NaviTable] = {
             ("id", "name", "slug", "city", "state_or_region", "postal_code",
              "country", "latitude", "longitude", "espresso_machine_id",
              "raspberry_pi_id", "accepting_orders", *_AUDIT),
+            required=True,
         ),
         NaviTable(
             "devices_raspberrypi",
@@ -174,7 +187,15 @@ class Cursor:
         return cls(ts=data.get("ts"), id=data["id"])
 
 
-def available_columns(conn: psycopg.Connection[Any], spec: NaviTable) -> list[str]:
+class MissingTableError(LookupError):
+    """A required Navi table (or its primary key) is absent. Not retryable."""
+
+
+TABLE_MISSING = "skipped: table missing"
+
+
+def available_columns(conn: psycopg.Connection[Any], spec: NaviTable) -> list[str] | None:
+    """Allowlisted columns present in the source, or None if the table is absent."""
     rows = conn.execute(
         """
         select column_name from information_schema.columns
@@ -184,8 +205,10 @@ def available_columns(conn: psycopg.Connection[Any], spec: NaviTable) -> list[st
     ).fetchall()
     present = {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
     if not present:
-        msg = f"navi table {spec.table} not found"
-        raise LookupError(msg)
+        return None
+    if "id" not in present:
+        msg = f"navi table {spec.table} has no id column"
+        raise MissingTableError(msg)
     return [c for c in spec.columns if c in present]
 
 
@@ -248,6 +271,8 @@ class ExtractResult:
     rows: int
     pages: int
     watermark: str | None
+    status: str = "ok"
+    missing_columns: list[str] = field(default_factory=list)
 
 
 def extract_table(
@@ -271,7 +296,19 @@ def extract_table(
     from crumb import warehouse as wh  # noqa: PLC0415
 
     columns = available_columns(navi, spec)
+    navi.rollback()
     wh.ensure_raw_table(warehouse, spec.raw_table)
+    if columns is None:
+        if spec.required:
+            msg = f"required navi table {spec.table} not found"
+            raise MissingTableError(msg)
+        log.warning("navi table %s not found in source; skipping (optional)", spec.table)
+        with warehouse.transaction():
+            wh.mark_skipped(warehouse, SOURCE, spec.table, TABLE_MISSING, run_id)
+        return ExtractResult(table=spec.table, rows=0, pages=0, watermark=None, status=TABLE_MISSING)
+    missing = [c for c in spec.columns if c not in columns]
+    if missing:
+        log.warning("navi table %s lacks columns %s; extracting without them", spec.table, missing)
     stored = None if full_refresh else wh.get_watermark(warehouse, SOURCE, spec.table)
     since = stored - lookback if stored and spec.watermark else None
 
@@ -308,4 +345,5 @@ def extract_table(
         rows=rows,
         pages=pages,
         watermark=max_ts.isoformat() if max_ts else None,
+        missing_columns=missing,
     )

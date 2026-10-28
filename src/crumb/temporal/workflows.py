@@ -32,7 +32,13 @@ with workflow.unsafe.imports_passed_through():
     from crumb.temporal.types import StepInput
     from crumb.temporal.types import TransformParams
 
-NON_RETRYABLE = ["ConfigError", "DataQualityError", "LookupError", "KeyError"]
+NON_RETRYABLE = [
+    "ConfigError",
+    "DataQualityError",
+    "MissingTableError",
+    "LookupError",
+    "KeyError",
+]
 
 EXTRACT_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=5),
@@ -139,7 +145,14 @@ class ExtractNaviWorkflow:
                     for t in tables
                 ]
             )
-            return {"rows": sum(r["rows"] for r in results), "tables": results}
+            skipped = {r["table"]: r["status"] for r in results if r.get("status", "ok") != "ok"}
+            if skipped:
+                workflow.logger.warning("navi tables skipped: %s", skipped)
+            return {
+                "rows": sum(r["rows"] for r in results),
+                "skipped_tables": skipped,
+                "tables": results,
+            }
 
         return await tracked(asdict(params), body)
 
