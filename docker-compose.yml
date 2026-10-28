@@ -1,0 +1,99 @@
+# Local dev stack. Ports chosen to avoid clashing with other projects:
+#   API 8020, warehouse 5440, navi-source 5441, Temporal 7233, Temporal UI 8233.
+name: crumb
+
+x-app: &app
+  build: .
+  image: ghcr.io/daniel-grinevich/crumb:local
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    CRUMB_WAREHOUSE_DSN: postgresql://crumb:crumb@warehouse:5432/crumb
+    CRUMB_NAVI_DSN: postgresql://crumb_reader:crumb_reader@navi-source:5432/navi
+    CRUMB_NAVI_SEED_DSN: postgresql://navi:navi@navi-source:5432/navi
+    CRUMB_TEMPORAL_ADDRESS: temporal:7233
+    CRUMB_TEMPORAL_UI_URL: http://localhost:8233
+  depends_on:
+    warehouse:
+      condition: service_healthy
+    navi-source:
+      condition: service_healthy
+    temporal:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  temporal:
+    image: temporalio/temporal:1.9.1
+    # Dev server only; root so it can write SQLite into the named volume.
+    user: "0:0"
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--ui-ip", "0.0.0.0",
+              "--db-filename", "/data/temporal.db"]
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    volumes:
+      - temporal-data:/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  warehouse:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: crumb
+      POSTGRES_PASSWORD: crumb
+      POSTGRES_DB: crumb
+    ports:
+      - "5440:5432"
+    volumes:
+      - warehouse-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crumb -d crumb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  navi-source:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: navi
+      POSTGRES_PASSWORD: navi
+      POSTGRES_DB: navi
+    ports:
+      - "5441:5432"
+    volumes:
+      - navi-source-data:/var/lib/postgresql/data
+      - ./docker/navi-source/init.sql:/docker-entrypoint-initdb.d/10-reader.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U navi -d navi"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    command: ["worker"]
+
+  api:
+    <<: *app
+    command: ["api"]
+    ports:
+      - "8020:8020"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  temporal-data:
+  warehouse-data:
+  navi-source-data:
