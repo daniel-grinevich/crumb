@@ -82,18 +82,18 @@ Deploys are tag-driven and build the single image `ghcr.io/daniel-grinevich/crum
 
 | Tag | Image tags pushed | rainbow-road change |
 |-----|-------------------|---------------------|
-| `v1.4.0-staging` (any `vX.Y.Z-staging*`) | `staging-latest`, `staging-<short-sha>`, the tag name | `staging/crumb/kustomization.yaml`: pod-template annotation `navi.dev/deployed-sha: "<short-sha>"` (ArgoCD auto-syncs) |
-| `v1.4.0` | `1.4.0`, `prod-latest`, `prod-<short-sha>`, the tag name | `production/crumb/kustomization.yaml`: `newTag: 1.4.0` (sync manually in ArgoCD) |
+| `staging` (one moving tag) | `staging-latest`, `staging-<short-sha>` | `staging/crumb/kustomization.yaml`: pod-template annotation `navi.dev/deployed-sha: "<short-sha>"` (ArgoCD auto-syncs) |
+| `v1.4.0` (any `vX.Y.Z`) | `1.4.0`, `prod-latest`, `prod-<short-sha>`, the tag name | `production/crumb/kustomization.yaml`: `newTag: 1.4.0` (sync manually in ArgoCD) |
 
 Staging always runs `staging-latest` (`imagePullPolicy: Always`); its `newTag` never changes.
 Bumping the `navi.dev/deployed-sha` annotation changes the pod template, so ArgoCD rolls the pods
-onto the freshly pushed image. `staging-<short-sha>` and the tag name are pushed for traceability
-and rollback. Production is pinned to the version tag.
+onto the freshly pushed image. `staging-<short-sha>` is pushed for traceability and rollback.
+Production is pinned to the version tag.
 
 ```sh
 git checkout main && git pull
-git tag v1.4.0-staging && git push origin v1.4.0-staging   # staging
-git tag v1.4.0 && git push origin v1.4.0                   # production
+git tag -f staging && git push -f origin staging   # staging: move the tag to this commit
+git tag v1.4.0 && git push origin v1.4.0           # production
 ```
 
 The manifest bump needs the `RAINBOW_ROAD_PAT` repo secret (write access to

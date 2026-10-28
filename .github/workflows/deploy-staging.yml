@@ -1,10 +1,11 @@
 name: Deploy staging
 
-# Tag a commit on main with e.g. v1.4.0-staging or v1.4.0-staging.2 to deploy it.
+# Deploy by moving the single `staging` tag to a commit on main:
+#   git tag -f staging <commit> && git push -f origin staging
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+-staging*'
+      - staging
 
 concurrency:
   group: deploy-staging
@@ -35,7 +36,7 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          commit=$(git rev-parse "${GITHUB_REF}^{commit}")
           if ! git merge-base --is-ancestor "$commit" "origin/${DEFAULT_BRANCH}"; then
             echo "::error::${GITHUB_REF_NAME} ($commit) is not reachable from origin/${DEFAULT_BRANCH}"
             exit 1
@@ -43,7 +44,7 @@ jobs:
 
       - name: Get short SHA
         id: sha
-        run: echo "short-sha=$(git rev-parse --short=7 "${GITHUB_REF_NAME}^{commit}")" >> "$GITHUB_OUTPUT"
+        run: echo "short-sha=$(git rev-parse --short=7 "${GITHUB_REF}^{commit}")" >> "$GITHUB_OUTPUT"
 
       - name: Log in to the container registry
         uses: docker/login-action@v4
@@ -63,7 +64,6 @@ jobs:
           tags: |
             type=raw,value=staging-latest
             type=raw,value=staging-${{ steps.sha.outputs.short-sha }}
-            type=ref,event=tag
 
       - name: Build and push Docker image
         id: push
